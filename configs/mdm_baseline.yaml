@@ -1,0 +1,48 @@
+experiment_name: "mdm_mnist_baseline"
+
+seed: 42
+
+logging:
+  level: "INFO"
+  log_dir: "outputs/logs"
+
+data:
+  root: "data"
+  batch_size: 128
+  num_workers: 4
+
+  # Для baseline MDM используем только чистый MNIST
+  p_missing: 0.0
+  binarize_threshold: 0.5
+  flatten: false
+  train_val_split: 0.9
+  download: true
+
+model:
+  # Кол-во каналов на входе/выходе UNet'а:
+  # 0, 1, MASK → 3 канала
+  image_channels: 3
+
+  # Базовое число каналов в UNet
+  base_channels: 64
+
+  # Множители каналов на разных разрешениях (28→14→7)
+  channel_multipliers: [1, 2, 2]
+
+  # Кол-во residual-блоков на каждое разрешение
+  num_res_blocks: 2
+
+  # Размер embedding’а времени: base_channels * time_emb_dim_mult
+  time_emb_dim_mult: 4
+
+  # Число шагов masked diffusion (для следующего этапа, scheduler)
+  num_timesteps: 100
+
+optim:
+  lr: 0.001
+  weight_decay: 0.0
+  num_epochs: 10
+  grad_clip: 1.0
+
+  # Можно переопределить из CLI
+  device: "mps"

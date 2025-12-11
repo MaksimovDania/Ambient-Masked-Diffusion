@@ -1,0 +1,17 @@
+experiment_name: "mnist_dataset_debug"
+
+seed: 42
+
+logging:
+  level: "INFO"
+  log_dir: "outputs/logs"
+
+data:
+  root: "data"
+  p_missing: 0.5
+  binarize_threshold: 0.5
+  batch_size: 64
+  num_workers: 2
+  flatten: false
+  download: true
+  train_val_split: 0.9

@@ -1,0 +1,7 @@
+experiment_name: "mdm_mnist_base"
+
+seed: 42
+
+logging:
+  level: "INFO"
+  log_dir: "outputs/logs"
