@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
 
 from .mdm_unet import MDMUNet
-from .mdm_scheduler import MaskSchedule, MaskScheduleConfig
+from .mdm_scheduler import MaskSchedule
 
 
 @dataclass
@@ -32,7 +32,7 @@ class MaskedDiffusionModel(nn.Module):
       - MaskSchedule (forward-процесс маскирования),
       - SUBS-параметризация (в духе MDLM для дискретных токенов). 
 
-    Основная функция для обучения: compute_loss(x_clean),
+    Основная функция для обучения: compute_loss(x_clean, obs_mask=None),
     где x_clean — бинарные изображения [B,1,H,W] с {0,1}.
     """
 
@@ -115,23 +115,11 @@ class MaskedDiffusionModel(nn.Module):
         """
         SUBS-параметризация, адаптированная под 2D-картинки.
 
-        В оригинальном MDLM:  
-        - mask-логит задаётся как -inf (маска никогда не предсказывается),
-        - для НЕзамаскированных токенов распределение делается вырожденным,
-          которое "копирует" xt (у нас xt=x0 на незамаскированных позициях).
-
-        Здесь:
-          logits:     [B, C(=3), H, W] — "сырые" выходы UNet,
-          xt_states:  [B, 1, H, W]     — текущее состояние {0,1,MASK},
-          x0_states:  [B, 1, H, W]     — истинное {0,1}; может быть None
-                                         (например, при семплинге).
-
-        Возвращает:
-          log_probs: [B, C, H, W] — log p(y | x_t), уже с SUBS,
-          т.е.:
-            - класс MASK практически impossible (≈0),
-            - на незамаскированных позициях — one-hot в x0,
-            - на масках — нормализованное распределение по {0,1}.
+        Возвращает log_probs [B,C,H,W] с:
+          - практически нулевой вероятностью MASK-класса,
+          - на незамаскированных позициях (xt != MASK) — вырожденное
+            распределение, копирующее x0 (если x0_states задан),
+          - на масках — нормализованное распределение по {0,1}.
         """
         if logits.dim() != 4:
             raise ValueError(
@@ -149,18 +137,16 @@ class MaskedDiffusionModel(nn.Module):
                 f"got {tuple(xt_states.shape)}"
             )
 
-        # 1) Запрещаем класс MASK (аналог logits[:, :, mask_index] += neg_inf)
-        #    → p(mask) ≈ 0.
         neg_inf = self.cfg.neg_infinity
+
+        # 1) "отключаем" класс MASK
         logits = logits.clone()
         logits[:, self.mask_token_id, :, :] += neg_inf
 
-        # 2) Нормализуем logits → log_probs (log p) по классам
-        #    (как в MDLM: logits - logsumexp(logits)).
+        # 2) log-softmax по классам
         log_probs = logits - torch.logsumexp(logits, dim=1, keepdim=True)
 
-        # Если x0_states не задан, мы не можем "копировать" незамаскированные
-        # токены, поэтому просто возвращаем log_probs с отключённым MASK.
+        # Без x0_states просто возвращаем лог-распределения без MASK
         if x0_states is None:
             return log_probs
 
@@ -170,70 +156,55 @@ class MaskedDiffusionModel(nn.Module):
                 f"must match xt_states shape {tuple(xt_states.shape)}"
             )
 
-        # 3) Обрабатываем незамаскированные токены:
-        #    для xt != MASK задаём вырожденное распределение,
-        #    которое всегда "копирует" x0 (0 или 1).
-        #    Это повторяет идею SUBS: незамаскированные токены не изменяются. 
+        # 3) Для НЕмаскированных позиций форсим вырожденное распределение,
+        #    "копирующее" истинный x0.
         unmasked = (xt_states != self.mask_token_id)  # [B,1,H,W]
         if unmasked.any():
-            # a) Target-класс из x0: {0,1}
             target = x0_states.squeeze(1).long()  # [B,H,W]
 
-            # b) Создаём вырожденное распределение: лог-вероятности
-            #    = 0 для target-класса и = -inf для остальных.
             log_probs_unmasked = torch.full_like(
                 log_probs, fill_value=neg_inf
             )  # [B,C,H,W]
 
-            # Перекладываем в [B,H,W,C] и разом обновляем по батчу
             log_probs_unmasked_flat = (
                 log_probs_unmasked.permute(0, 2, 3, 1).contiguous().view(-1, C)
             )
             target_flat = target.view(-1)  # [B*H*W]
-            # Только там, где унмаск, заполняем 0 в нужном классе
-            # Остальные элементы остаются -inf, но это неважно,
-            # т.к. мы будет смешивать по unmasked mask'у.
-            row_idx = torch.arange(log_probs_unmasked_flat.shape[0], device=logits.device)
-
+            row_idx = torch.arange(
+                log_probs_unmasked_flat.shape[0],
+                device=logits.device,
+            )
+            # ставим 0 в таргет-классе, остальные остаются -inf
             log_probs_unmasked_flat[row_idx, target_flat] = 0.0
-            # Возвращаем форму [B,C,H,W]
+
             log_probs_unmasked = (
                 log_probs_unmasked_flat.view(B, H, W, C).permute(0, 3, 1, 2)
-            )
+            )  # [B,C,H,W]
 
-            # c) Обновляем log_probs на незамаскированных позициях:
-            #    там ставим вырожденное распределение, на масках оставляем
-            #    "обучаемое" распределение.
             unmasked_broadcast = unmasked.expand_as(log_probs)  # [B,C,H,W]
-            # log_probs = torch.where(unmasked_broadcast, log_probs_unmasked, log_probs)
-            # WORKAROUND for MPS: torch.where might be buggy with large negative values/broadcasting
+            # БЕЗ torch.where: просто перезаписываем нужные элементы
             log_probs[unmasked_broadcast] = log_probs_unmasked[unmasked_broadcast]
 
         return log_probs
 
     # ------------------------------------------------------------------
-    # Основной лосс — masked LM в стиле MDLM
+    # Основной лосс — masked LM в стиле MDLM (+ поддержка obs_mask)
     # ------------------------------------------------------------------
-    def compute_loss(self, x_clean: Tensor) -> Tensor:
+    def compute_loss(
+        self,
+        x_clean: Tensor,
+        obs_mask: Optional[Tensor] = None,
+    ) -> Tensor:
         """
         Считает MLM-подобный loss для одного батча.
 
-        Параметры
-        ---------
-        x_clean : FloatTensor
-            Бинарные изображения [B,1,H,W] с {0,1}.
-
-        Алгоритм
-        --------
-        1) Проверяем бинарность x_clean.
-        2) Семплируем t ~ Uniform({1..T}).
-        3) q(z_t | x0) через MaskSchedule.forward_mask → xt_states, mask_positions.
-        4) Кодируем xt_states в one-hot и подаём в UNet с t.
-        5) Применяем SUBS-параметризацию к logits.
-        6) Считаем NLL(x0 | xt, t) по замаскированным пикселям,
-           используя log_probs как log p. (F.nll_loss).
-
-        Возвращает скалярный loss (усреднение по маскированным пикселям).
+        x_clean : [B,1,H,W], бинарные {0,1}.
+        obs_mask : [B,1,H,W] или None.
+          - None: обычный baseline MDM (маска берётся из forward-процесса).
+          - не None: готовим почву для Ambient Diffusion:
+              * forward-процесс всё ещё добавляет СВОЮ маску (доп. порча),
+              * лосс усредняем ТОЛЬКО по пикселям, где obs_mask == 1
+                (т.е. по наблюдаемым "A").
         """
         if x_clean.dim() != 4:
             raise ValueError(
@@ -248,8 +219,20 @@ class MaskedDiffusionModel(nn.Module):
 
         self._check_binary_x(x_clean)
 
-        x_clean = x_clean.to(self.unet.device if hasattr(self.unet, "device") else x_clean.device)
         device = x_clean.device
+
+        # ---- obs_mask ----
+        if obs_mask is None:
+            obs_mask = torch.ones_like(x_clean)
+        else:
+            if obs_mask.shape != x_clean.shape:
+                raise ValueError("obs_mask shape must match x_clean")
+            
+            # ожидаем 0/1 (float или int, главное значения)
+            # if not torch.all((obs_mask == 0) | (obs_mask == 1)):
+            #    raise ValueError("obs_mask must contain only 0/1")
+            
+            obs_mask = obs_mask.to(device).float()
 
         # 1) t ~ Uniform({1..T})
         t = self.schedule.sample_timesteps(batch_size=B, device=device)  # [B]
@@ -257,32 +240,38 @@ class MaskedDiffusionModel(nn.Module):
         # 2) Forward-процесс: q(z_t | x0)
         xt_states, mask_positions = self.schedule.forward_mask(x_clean, t)
         # xt_states: [B,1,H,W] в {0,1,MASK}
-        # mask_positions: [B,1,H,W] bool
+        # mask_positions: [B,1,H,W] bool (где МЫ замаскировали дополнительно)
+
+        # ----- A(x): учитываем исходную маску наблюдений -----
+        # Если obs_mask == 0, то пиксель отсутствует изначально -> ставим MASK
+        missing = (obs_mask == 0)
+        if missing.any():
+            xt_states = xt_states.clone()
+            xt_states[missing] = self.mask_token_id
 
         # 3) Кодируем xt в one-hot по каналам
         xt_one_hot = self._encode_states(xt_states)  # [B,3,H,W]
 
         # 4) Прогоняем UNet
-        #    (t подаём как float/int — TimeEmbedding внутри приведёт к float).
         logits = self.unet(xt_one_hot, t)  # [B,3,H,W]
 
-        # 5) SUBS-параметризация → log_probs (log p(y | xt, t))
+        # 5) SUBS-параметризация → log_probs
         x0_states = x_clean.long()  # [B,1,H,W] с {0,1}
         log_probs = self._subs_parameterization(
-            logits=logits, xt_states=xt_states, x0_states=x0_states
+            logits=logits,
+            xt_states=xt_states,
+            x0_states=x0_states,
         )  # [B,3,H,W]
 
-        # 6) NLL по маскированным пикселям.
-        #    x0 — target классы (0 или 1; класс MASK=2 никогда не используется).
+        # 6) NLL по пикселям
         target = x0_states.squeeze(1).view(-1)  # [B*H*W]
         log_probs_flat = (
             log_probs.view(B, self.num_classes, H * W)
             .permute(0, 2, 1)
             .contiguous()
             .view(-1, self.num_classes)
-        )  # [B*H*W, 3]
+        )  # [B*H*W,3]
 
-        # NLL per-pixel (включая все позиции)
         nll_flat = F.nll_loss(
             log_probs_flat,
             target,
@@ -291,16 +280,17 @@ class MaskedDiffusionModel(nn.Module):
 
         nll = nll_flat.view(B, 1, H, W)  # [B,1,H,W]
 
-        # Маска для усреднения: только по маскированным позициям
-        mask = mask_positions.float()  # [B,1,H,W]
-        masked_count = mask.sum()
+        # ---- маска для усреднения ----
+        mask_positions_float = mask_positions.float()  # где forward маскировал
+        train_mask = mask_positions_float * obs_mask   # И forward-маска, И наблюдаемо изначально
+
+        masked_count = train_mask.sum()
 
         if masked_count < 1:
-            # На всякий случай: если ни одного маскированного пикселя не получилось
-            # (маловероятно, но теоретически возможно), усредняем по всем.
-            loss = nll.mean()
+            # fallback: усредняем по наблюдаемым, но это редкий случай (практически 0)
+            loss = (nll * obs_mask).sum() / (obs_mask.sum() + 1e-8)
         else:
-            loss = (nll * mask).sum() / masked_count
+            loss = (nll * train_mask).sum() / masked_count
 
         return loss
 
@@ -318,17 +308,16 @@ class MaskedDiffusionModel(nn.Module):
 
         1) Начинаем с z_T = "всё MASK".
         2) Прогоняем UNet на шаге t=T.
-        3) Берём argmax по {0,1} в каждой позиции → бинарное изображение.
+        3) Семплируем по {0,1} → бинарное изображение.
 
         Это НЕ полная реализация обратного диффузионного процесса,
-        а просто sanity-check, что модель вообще что-то осмысленное
-        выучила при обучении (как грубый "denoising" из полного шума).
+        а просто sanity-check.
         """
         if device is None:
             device = next(self.unet.parameters()).device
 
         B = num_samples
-        H = W = 28  # для MNIST
+        H = W = 28  # MNIST
 
         # 1) Всё MASK
         xt_states = torch.full(
@@ -338,7 +327,7 @@ class MaskedDiffusionModel(nn.Module):
             device=device,
         )
 
-        # 2) t = T для всех
+        # 2) t = T
         t = torch.full(
             (B,),
             fill_value=self.schedule.num_timesteps,
@@ -349,31 +338,21 @@ class MaskedDiffusionModel(nn.Module):
         xt_one_hot = self._encode_states(xt_states)  # [B,3,H,W]
         logits = self.unet(xt_one_hot, t)            # [B,3,H,W]
 
-        # Для семплинга x0 нам SUBS нужна только чтобы убрать MASK-класс.
         log_probs = self._subs_parameterization(
-            logits=logits,
+            logits=logits,   # ОЙ, опечатка — нужно logits
             xt_states=xt_states,
-            x0_states=None,  # нет истинного x0 при генерации
-        )  # [B,3,H,W]
+            x0_states=None,
+        )
 
-        # Берём argmax по классам (0,1; MASK-класс ≈ -inf).
         probs = log_probs.exp()  # [B,3,H,W]
-        # x_samples = probs[:, :2, :, :].argmax(dim=1, keepdim=True)  # [B,1,H,W] в {0,1}
-        # Вместо argmax семплируем из категориального распределения по 0/1
-        # чтобы получить хоть какое-то разнообразие, если вход одинаковый.
-        # Но для генерации "one-shot" argmax обычно ок, если модель уверена.
-        # Если модель не уверена, argmax выдаст самый вероятный (фон).
-        
-        # Попробуем семплировать
+
+        # Берём только классы 0 и 1, нормализуем и семплируем категориально
         probs_01 = probs[:, :2, :, :]
-        # Нормализуем заново (так как mask отбросили)
         probs_01 = probs_01 / (probs_01.sum(dim=1, keepdim=True) + 1e-8)
-        
-        # Семплируем
-        # [B, 2, H, W] -> [B, H, W, 2] -> flatten -> multinomial
+
         B_sz, _, H_sz, W_sz = probs_01.shape
         probs_flat = probs_01.permute(0, 2, 3, 1).reshape(-1, 2)
         samples_flat = torch.multinomial(probs_flat, num_samples=1)
         x_samples = samples_flat.view(B_sz, 1, H_sz, W_sz).float()
-        
+
         return x_samples

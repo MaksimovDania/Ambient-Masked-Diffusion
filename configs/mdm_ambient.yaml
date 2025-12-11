@@ -1,0 +1,35 @@
+experiment_name: mdm_mnist_ambient
+seed: 42
+device: mps   # можно поменять на "cuda" или "cpu"
+
+logging:
+  level: INFO
+  log_dir: outputs/logs
+
+data:
+  root: data
+  batch_size: 64
+  p_missing: 0.5           # <--- главная разница с baseline
+  binarize_threshold: 0.5
+  flatten: false
+  train_val_split: 0.9
+  num_workers: 4
+  download: true
+
+model:
+  image_channels: 3
+  base_channels: 64
+  channel_multipliers: [1, 2, 2]
+  num_res_blocks: 2
+  time_emb_dim_mult: 4
+
+  num_timesteps: 100
+  alpha_min: 0.01
+  schedule_type: linear
+
+optim:
+  lr: 0.001
+  weight_decay: 0.0
+  num_epochs: 10
+  grad_clip: null
+  log_interval: 100

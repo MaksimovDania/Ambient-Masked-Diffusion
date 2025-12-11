@@ -11,7 +11,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from src.data import create_mnist_dataloaders
+from src.data.mnist import create_mnist_dataloaders
 from src.models.mdm_unet import MDMUNet, MDMUNetConfig
 from src.models.mdm_scheduler import MaskSchedule, MaskScheduleConfig
 from src.models.mdm_model import MaskedDiffusionModel, MaskedDiffusionConfig
@@ -36,8 +36,8 @@ def parse_args():
 
 def build_checkpoint_prefix(cfg_dict) -> str:
     """
-    Строим человекочитаемый префикс имени чекпоинтов,
-    включающий некоторые важные гиперпараметры.
+    Строим человекочитаемый префикс имени чекпоинтов
+    с ключевыми гиперпараметрами.
 
     Пример:
       mdm_mnist_baseline_lr0p001_bs128_T100_ch64
@@ -52,9 +52,7 @@ def build_checkpoint_prefix(cfg_dict) -> str:
     T = model_cfg.get("num_timesteps", 100)
     base_ch = model_cfg.get("base_channels", 64)
 
-    # Строка lr без точки
     lr_str = str(lr).replace(".", "p")
-
     prefix = f"{exp_name}_lr{lr_str}_bs{batch_size}_T{T}_ch{base_ch}"
     return prefix
 
@@ -88,12 +86,12 @@ def main():
     device = cfg_dict.get("device", "mps")
     logger.info(f"Using device: {device}")
 
-    # --------- Данные (чистый бинарный MNIST, p_missing=0.0) ---------
+    # --------- Данные: бинарный MNIST с возможными пропусками ---------
     data_cfg = cfg_dict.get("data", {})
     train_loader, val_loader = create_mnist_dataloaders(
         root=data_cfg.get("root", "data"),
         batch_size=data_cfg.get("batch_size", 128),
-        p_missing=data_cfg.get("p_missing", 0.0),  # baseline: без порчи
+        p_missing=data_cfg.get("p_missing", 0.0),  # baseline: по умолчанию без пропусков
         binarize_threshold=data_cfg.get("binarize_threshold", 0.5),
         flatten=data_cfg.get("flatten", False),
         train_val_split=data_cfg.get("train_val_split", 0.9),

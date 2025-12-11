@@ -2,25 +2,28 @@
 
 ## Completed
 -   [x] **Project Structure**: Set up folders for `src`, `configs`, `scripts`, `outputs`.
--   [x] **Data Pipeline**: MNIST downloading and loading (implied working).
+-   [x] **Data Pipeline**: MNIST downloading and loading.
 -   [x] **Model Implementation**:
-    -   [x] `MaskedDiffusionModel` wrapper.
-    -   [x] `MDMUNet` architecture (updated to robust version).
+    -   [x] `MaskedDiffusionModel` wrapper with ambient loss support.
+    -   [x] `MDMUNet` architecture (fixed time embeddings).
     -   [x] `MaskSchedule` linear schedule.
--   [x] **Training Loop**: `Trainer` class implemented and functional.
+-   [x] **Training Scripts**:
+    -   [x] `train_baseline_mdm.py` (baseline).
+    -   [x] `train__mdm_ambient.py` (ambient).
+-   [x] **Utilities**:
+    -   [x] `visualize_checkpoint.py`.
 -   [x] **Configuration**: YAML config support.
--   [x] **Baseline Run**: First run of `train_baseline_mdm.py` completed (diverged).
--   [x] **Debugging**: Identified cause of divergence (incorrect time embedding normalization).
+-   [x] **Debugging**: Resolved time embedding divergence issue.
+-   [x] **Ambient Experiments**:
+    -   [x] Run `train__mdm_ambient.py` with `p_missing=0.5`.
+    -   [x] Verify reconstruction quality on missing data (confirmed high quality at Epoch 4).
 
 ## In Progress
--   [ ] **Verification**: Re-run baseline training to ensure fix works.
+-   [ ] **Evaluation**:
+    -   [ ] Wait for final training epoch.
+    -   [ ] Final visual inspection.
 
 ## Todo
--   [ ] **Ambient Implementation**:
-    -   [ ] Verify `p_missing` logic in dataset/loader.
-    -   [ ] Run experiments with missing data.
--   [ ] **Evaluation**:
-    -   [ ] Implement FID or other metrics? (Optional, visual inspection used currently).
 -   [ ] **Refinement**:
     -   [ ] Tune hyperparameters (LR, batch size, model size).
     -   [ ] Experiment with different masking schedules (e.g., cosine).
