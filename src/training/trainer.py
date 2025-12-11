@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
-from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+import torchvision.utils as vutils
 
 from src.models.mdm_model import MaskedDiffusionModel
 
@@ -20,19 +22,29 @@ class TrainerConfig:
     num_epochs:
         Количество эпох обучения.
     grad_clip:
-        Максимальная норма градиента (если None, не применяем клиппинг).
+        Максимальная норма градиента (если None, клиппинг не используется).
     log_interval:
         Как часто логировать train loss (в шагах).
     checkpoint_dir:
         Папка для сохранения чекпоинтов.
+    sample_dir:
+        Папка для сохранения картинок (сэмплы, реконструкции).
     experiment_name:
-        Имя эксперимента (используется в именах файлов).
+        Имя эксперимента (будет частью префикса).
+    checkpoint_prefix:
+        Префикс для имени файлов чекпоинтов/картинок.
+        Если None, будет использовано experiment_name.
+    use_tqdm:
+        Использовать ли tqdm для прогресс-баров.
     """
     num_epochs: int = 10
     grad_clip: Optional[float] = None
     log_interval: int = 100
     checkpoint_dir: str = "outputs/checkpoints"
+    sample_dir: str = "outputs/samples"
     experiment_name: str = "mdm_experiment"
+    checkpoint_prefix: Optional[str] = None
+    use_tqdm: bool = True
 
 
 class Trainer:
@@ -40,14 +52,15 @@ class Trainer:
     Простой тренер для MaskedDiffusionModel.
 
     Ожидается, что:
-      - model: имеет метод compute_loss(x_clean),
-      - train_loader/val_loader: возвращают словари с ключом "x_clean",
-      - optimizer: любой оптимизатор PyTorch.
+      - model: имеет метод compute_loss(x_clean) и sample(num_samples, device),
+      - train_loader / val_loader: возвращают словари с ключом "x_clean",
+      - optimizer: любой torch.optim.Optimizer.
 
-    Пример использования:
-      cfg = TrainerConfig(...)
-      trainer = Trainer(model, optimizer, train_loader, val_loader, device, cfg, logger)
-      trainer.fit()
+    После каждой эпохи:
+      - сохраняется чекпоинт,
+      - сохраняются:
+          * samples:   unconditional сэмплы модели,
+          * recon:     оригиналы из валидации + их реконструкции.
     """
 
     def __init__(
@@ -71,11 +84,16 @@ class Trainer:
         # Переносим модель на нужное устройство
         self.model.to(self.device)
 
-        # Подготовка папки для чекпоинтов
-        os.makedirs(self.cfg.checkpoint_dir, exist_ok=True)
+        # Префикс имён файлов (с гиперпараметрами формируется в скрипте)
+        self.checkpoint_prefix = (
+            self.cfg.checkpoint_prefix or self.cfg.experiment_name
+        )
 
-        # Лучший валид. лосс для сохранения best.pt
-        self.best_val_loss: Optional[float] = None
+        # Подготовка папок для чекпоинтов и картинок
+        os.makedirs(self.cfg.checkpoint_dir, exist_ok=True)
+        # Сэмплы кладём в подкаталог с именем префикса
+        self.sample_dir = os.path.join(self.cfg.sample_dir, self.checkpoint_prefix)
+        os.makedirs(self.sample_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
     # Вспомогательные методы
@@ -91,35 +109,206 @@ class Trainer:
         x_clean = batch["x_clean"].to(self.device)
         return x_clean
 
-    def _save_checkpoint(self, epoch: int, is_best: bool = False) -> None:
+    def _save_checkpoint(self, epoch: int) -> None:
         """
         Сохраняет чекпоинт модели и оптимизатора.
 
-        last-чекпоинт:   <checkpoint_dir>/<experiment_name>_last.pt
-        best-чекпоинт:   <checkpoint_dir>/<experiment_name>_best.pt
+        Имена файлов:
+          <checkpoint_dir>/<checkpoint_prefix>_epochXXX.pt
+        где XXX — номер эпохи с нулями слева.
         """
         state = {
             "epoch": epoch,
             "model_state": self.model.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
-            "best_val_loss": self.best_val_loss,
-            "config": self.cfg,
+            "trainer_config": self.cfg,
         }
 
-        last_path = os.path.join(
-            self.cfg.checkpoint_dir,
-            f"{self.cfg.experiment_name}_last.pt",
-        )
-        torch.save(state, last_path)
-        self.logger.info(f"Saved checkpoint: {last_path}")
+        filename = f"{self.checkpoint_prefix}_epoch{epoch:03d}.pt"
+        path = os.path.join(self.cfg.checkpoint_dir, filename)
+        torch.save(state, path)
+        self.logger.info(f"Saved checkpoint: {path}")
 
-        if is_best:
-            best_path = os.path.join(
-                self.cfg.checkpoint_dir,
-                f"{self.cfg.experiment_name}_best.pt",
+    def _subs_inference_from_xt(
+        self,
+        xt_states: torch.Tensor,
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        SUBS-подобный шаг для инференса (реконструкция из xt).
+
+        xt_states: [B,1,H,W]  с {0,1,MASK}
+        logits:    [B,C,H,W]  "сырые" выходы UNet по классам {0,1,MASK}
+
+        Возвращает:
+            x_recon: [B,1,H,W] с {0,1}
+        """
+        if xt_states.dim() != 4 or logits.dim() != 4:
+            raise ValueError(
+                f"_subs_inference_from_xt: expected xt_states [B,1,H,W] "
+                f"and logits [B,C,H,W], got {tuple(xt_states.shape)}, {tuple(logits.shape)}"
             )
-            torch.save(state, best_path)
-            self.logger.info(f"Saved BEST checkpoint: {best_path}")
+
+        B, C, H, W = logits.shape
+        mask_id = self.model.mask_token_id
+        if C != self.model.num_classes:
+            raise ValueError(
+                f"_subs_inference_from_xt: expected logits C={self.model.num_classes}, got {C}"
+            )
+
+        neg_inf = self.model.cfg.neg_infinity
+
+        # 1) Запрещаем класс MASK
+        logits = logits.clone()
+        logits[:, mask_id, :, :] += neg_inf
+
+        # 2) Нормализуем → log_probs
+        log_probs = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+
+        # 3) Для незамаскированных токенов (xt != MASK) форсим вырожденное
+        #    распределение, копирующее xt (как в SUBS). 
+        unmasked = (xt_states != mask_id)  # [B,1,H,W]
+        if unmasked.any():
+            target = xt_states.squeeze(1).long()  # [B,H,W]
+
+            # шаблон: всё = -inf
+            forced = torch.full_like(log_probs, fill_value=neg_inf)  # [B,C,H,W]
+
+            forced_flat = (
+                forced.permute(0, 2, 3, 1).contiguous().view(-1, C)
+            )  # [B*H*W,C]
+            target_flat = target.view(-1)  # [B*H*W]
+            row_idx = torch.arange(forced_flat.shape[0], device=logits.device)
+            forced_flat[row_idx, target_flat] = 0.0
+
+            forced = (
+                forced_flat.view(B, H, W, C).permute(0, 3, 1, 2)
+            )  # [B,C,H,W]
+
+            unmasked_broadcast = unmasked.expand_as(log_probs)
+            log_probs[unmasked_broadcast] = forced[unmasked_broadcast]
+
+        # 4) Предсказываем класс: argmax по {0,1}, MASK игнорируем (≈ -inf)
+        probs = log_probs.exp()  # [B,C,H,W]
+        # берём только первые два класса (0 и 1)
+        x_recon = probs[:, :2, :, :].argmax(dim=1, keepdim=True)  # [B,1,H,W]
+        return x_recon.float()
+
+    def _reconstruct_from_masked(
+        self,
+        x_clean: torch.Tensor,
+        t_value: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Строит реконструкцию изображений из зашумлённой версии.
+
+        Алгоритм (упрощённый):
+          1) Выбираем фиксированный шаг t (по умолчанию t = T).
+          2) Генерируем xt ~ q(z_t | x0) через MaskSchedule.
+          3) Прогоняем UNet по xt.
+          4) Применяем SUBS-подобное правило для инференса.
+        """
+        self.model.eval()
+        B, C, H, W = x_clean.shape
+        if C != 1:
+            raise ValueError(
+                f"_reconstruct_from_masked: expected x_clean with C=1, got C={C}"
+            )
+
+        if t_value is None:
+            t_value = self.model.schedule.num_timesteps
+
+        t = torch.full(
+            (B,),
+            fill_value=t_value,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        # 1) Forward-процесс (маскирование)
+        xt_states, _ = self.model.schedule.forward_mask(x_clean, t)  # [B,1,H,W]
+
+        # 2) one-hot кодирование xt
+        states_flat = xt_states.view(B, H, W)  # [B,H,W]
+        one_hot = F.one_hot(
+            states_flat, num_classes=self.model.num_classes
+        ).permute(0, 3, 1, 2).float()  # [B,C,H,W]
+
+        # 3) UNet
+        logits = self.model.unet(one_hot, t)  # [B,C,H,W]
+
+        # 4) SUBS-подобное восстановление
+        x_recon = self._subs_inference_from_xt(xt_states, logits)
+        return x_recon
+
+    @torch.no_grad()
+    def _save_visualizations(self, epoch: int) -> None:
+        """
+        Сохраняет:
+          - unconditional сэмплы модели,
+          - оригиналы + реконструкции из валидационного датасета
+            в одной картинке (верхний ряд — оригинал, нижний — реконструкция).
+        """
+        self.model.eval()
+        
+        # Ensure directory exists
+        os.makedirs(self.sample_dir, exist_ok=True)
+
+        num_vis = 8  # сколько примеров показывать
+
+        # --------- 1) Unconditional сэмплы ---------
+        samples = self.model.sample(
+            num_samples=num_vis, device=self.device
+        )  # [B,1,H,W]
+        samples = samples.clamp(0.0, 1.0)
+
+        samples_path = os.path.join(
+            self.sample_dir,
+            f"{self.checkpoint_prefix}_epoch{epoch:03d}_samples.png",
+        )
+        vutils.save_image(
+            samples,
+            samples_path,
+            nrow=num_vis,
+            normalize=False,
+        )
+
+        # --------- 2) Оригиналы + реконструкции ---------
+        # Берём один батч из val_loader
+        try:
+            val_batch = next(iter(self.val_loader))
+        except StopIteration:
+            self.logger.warning(
+                "_save_visualizations: val_loader is empty, "
+                "skipping reconstructions."
+            )
+            return
+
+        x_clean = self._move_batch_to_device(val_batch)[:num_vis]  # [B,1,H,W]
+        
+        # FIX: используем t = T/2, чтобы проверить способность модели 
+        # восстанавливать детали (inpainting), а не генерировать с нуля.
+        # При t=T и argmax модель (верно) предсказывает фон (наиболее вероятный класс),
+        # что выглядит как черный квадрат.
+        t_mid = self.model.schedule.num_timesteps // 2
+        x_recon = self._reconstruct_from_masked(x_clean, t_value=t_mid) # [B,1,H,W]
+
+        # Склеиваем: сначала все оригиналы, затем реконструкции
+        both = torch.cat([x_clean, x_recon], dim=0)  # [2B,1,H,W]
+
+        recon_path = os.path.join(
+            self.sample_dir,
+            f"{self.checkpoint_prefix}_epoch{epoch:03d}_recon.png",
+        )
+        vutils.save_image(
+            both,
+            recon_path,
+            nrow=num_vis,
+            normalize=False,
+        )
+
+        self.logger.info(f"Saved samples to:        {samples_path}")
+        self.logger.info(f"Saved reconstructions to:{recon_path}")
 
     # ------------------------------------------------------------------
     # Основные циклы обучения/валидации
@@ -134,7 +323,15 @@ class Trainer:
         running_loss = 0.0
         num_batches = 0
 
-        for step, batch in enumerate(self.train_loader, start=1):
+        iterator = self.train_loader
+        if self.cfg.use_tqdm:
+            iterator = tqdm(
+                self.train_loader,
+                desc=f"Train epoch {epoch}",
+                leave=False,
+            )
+
+        for step, batch in enumerate(iterator, start=1):
             x_clean = self._move_batch_to_device(batch)
 
             loss = self.model.compute_loss(x_clean)
@@ -178,7 +375,15 @@ class Trainer:
         running_loss = 0.0
         num_batches = 0
 
-        for batch in self.val_loader:
+        iterator = self.val_loader
+        if self.cfg.use_tqdm:
+            iterator = tqdm(
+                self.val_loader,
+                desc=f"Val   epoch {epoch}",
+                leave=False,
+            )
+
+        for batch in iterator:
             x_clean = self._move_batch_to_device(batch)
             loss = self.model.compute_loss(x_clean)
 
@@ -201,8 +406,8 @@ class Trainer:
         На каждой эпохе:
           - train_epoch,
           - validate,
-          - сохранение last-чекпоинта,
-          - при улучшении val loss — сохранение best-чекпоинта.
+          - сохранение чекпоинта,
+          - сохранение сэмплов и реконструкций.
         """
         self.logger.info(
             f"Starting training for {self.cfg.num_epochs} epochs "
@@ -213,15 +418,13 @@ class Trainer:
             train_loss = self.train_epoch(epoch)
             val_loss = self.validate(epoch)
 
-            # Обновляем best_val_loss и сохраняем чекпоинты
-            is_best = False
-            if self.best_val_loss is None or val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                is_best = True
-                self.logger.info(
-                    f"New best val loss: {val_loss:.4f} (epoch {epoch})"
-                )
+            self.logger.info(
+                f"[Epoch {epoch}] train_loss={train_loss:.4f} "
+                f"| val_loss={val_loss:.4f}"
+            )
 
-            self._save_checkpoint(epoch, is_best=is_best)
+            # Чекпоинт + визуализации
+            self._save_checkpoint(epoch)
+            self._save_visualizations(epoch)
 
         self.logger.info("Training finished.")

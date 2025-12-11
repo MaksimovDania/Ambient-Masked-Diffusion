@@ -20,7 +20,7 @@ class MaskedDiffusionConfig:
         Большое отрицательное число, используемое для "отключения"
         логитов (аналог -inf в SUBS-параметризации MDLM). 
     """
-    neg_infinity: float = -1e9
+    neg_infinity: float = -1e4
 
 
 class MaskedDiffusionModel(nn.Module):
@@ -205,7 +205,9 @@ class MaskedDiffusionModel(nn.Module):
             #    там ставим вырожденное распределение, на масках оставляем
             #    "обучаемое" распределение.
             unmasked_broadcast = unmasked.expand_as(log_probs)  # [B,C,H,W]
-            log_probs = torch.where(unmasked_broadcast, log_probs_unmasked, log_probs)
+            # log_probs = torch.where(unmasked_broadcast, log_probs_unmasked, log_probs)
+            # WORKAROUND for MPS: torch.where might be buggy with large negative values/broadcasting
+            log_probs[unmasked_broadcast] = log_probs_unmasked[unmasked_broadcast]
 
         return log_probs
 
@@ -356,6 +358,22 @@ class MaskedDiffusionModel(nn.Module):
 
         # Берём argmax по классам (0,1; MASK-класс ≈ -inf).
         probs = log_probs.exp()  # [B,3,H,W]
-        x_samples = probs[:, :2, :, :].argmax(dim=1, keepdim=True)  # [B,1,H,W] в {0,1}
-
-        return x_samples.float()
+        # x_samples = probs[:, :2, :, :].argmax(dim=1, keepdim=True)  # [B,1,H,W] в {0,1}
+        # Вместо argmax семплируем из категориального распределения по 0/1
+        # чтобы получить хоть какое-то разнообразие, если вход одинаковый.
+        # Но для генерации "one-shot" argmax обычно ок, если модель уверена.
+        # Если модель не уверена, argmax выдаст самый вероятный (фон).
+        
+        # Попробуем семплировать
+        probs_01 = probs[:, :2, :, :]
+        # Нормализуем заново (так как mask отбросили)
+        probs_01 = probs_01 / (probs_01.sum(dim=1, keepdim=True) + 1e-8)
+        
+        # Семплируем
+        # [B, 2, H, W] -> [B, H, W, 2] -> flatten -> multinomial
+        B_sz, _, H_sz, W_sz = probs_01.shape
+        probs_flat = probs_01.permute(0, 2, 3, 1).reshape(-1, 2)
+        samples_flat = torch.multinomial(probs_flat, num_samples=1)
+        x_samples = samples_flat.view(B_sz, 1, H_sz, W_sz).float()
+        
+        return x_samples
