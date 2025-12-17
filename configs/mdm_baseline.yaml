@@ -22,7 +22,11 @@ model:
   # Кол-во каналов на входе/выходе UNet'а:
   # 0, 1, MASK → 3 канала
   image_channels: 3
-
+  training_mode: baseline
+  uncond_num_steps: 50
+  # Consistency loss (регуляризатор для согласованности предсказаний на соседних шагах)
+  consistency_weight: 0.0  # 0.0 = выключено, >0.0 = включено (например, 0.1, 0.5)
+  consistency_pair_offset: 1  # разница между соседними временами в паре (t_hi, t_lo)
   # Базовое число каналов в UNet
   base_channels: 64
 

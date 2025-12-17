@@ -6,12 +6,12 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import torchvision.utils as vutils
 
 from src.models.mdm_model import MaskedDiffusionModel
+from src.training.visualization import make_xt_from_xclean, reconstruct_from_xt, save_triplet_grid
 
 
 @dataclass
@@ -36,6 +36,8 @@ class TrainerConfig:
         Если None, будет использовано experiment_name.
     use_tqdm:
         Использовать ли tqdm для прогресс-баров.
+    uncond_num_steps:
+        Количество итераций для unconditional sampler (только для `*_samples.png`).
     """
     num_epochs: int = 10
     grad_clip: Optional[float] = None
@@ -45,6 +47,7 @@ class TrainerConfig:
     experiment_name: str = "mdm_experiment"
     checkpoint_prefix: Optional[str] = None
     use_tqdm: bool = True
+    uncond_num_steps: int = 50
 
 
 class Trainer:
@@ -52,7 +55,7 @@ class Trainer:
     Простой тренер для MaskedDiffusionModel.
 
     Ожидается, что:
-      - model: имеет метод compute_loss(x_clean) и sample(num_samples, device),
+      - model: имеет метод compute_loss(x_clean) и sample(num_samples, device, num_steps),
       - train_loader / val_loader: возвращают словари с ключом "x_clean",
       - optimizer: любой torch.optim.Optimizer.
 
@@ -129,118 +132,6 @@ class Trainer:
         torch.save(state, path)
         self.logger.info(f"Saved checkpoint: {path}")
 
-    def _subs_inference_from_xt(
-        self,
-        xt_states: torch.Tensor,
-        logits: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        SUBS-подобный шаг для инференса (реконструкция из xt).
-
-        xt_states: [B,1,H,W]  с {0,1,MASK}
-        logits:    [B,C,H,W]  "сырые" выходы UNet по классам {0,1,MASK}
-
-        Возвращает:
-            x_recon: [B,1,H,W] с {0,1}
-        """
-        if xt_states.dim() != 4 or logits.dim() != 4:
-            raise ValueError(
-                f"_subs_inference_from_xt: expected xt_states [B,1,H,W] "
-                f"and logits [B,C,H,W], got {tuple(xt_states.shape)}, {tuple(logits.shape)}"
-            )
-
-        B, C, H, W = logits.shape
-        mask_id = self.model.mask_token_id
-        if C != self.model.num_classes:
-            raise ValueError(
-                f"_subs_inference_from_xt: expected logits C={self.model.num_classes}, got {C}"
-            )
-
-        neg_inf = self.model.cfg.neg_infinity
-
-        # 1) Запрещаем класс MASK
-        logits = logits.clone()
-        logits[:, mask_id, :, :] += neg_inf
-
-        # 2) Нормализуем → log_probs
-        log_probs = logits - torch.logsumexp(logits, dim=1, keepdim=True)
-
-        # 3) Для незамаскированных токенов (xt != MASK) форсим вырожденное
-        #    распределение, копирующее xt (как в SUBS). 
-        unmasked = (xt_states != mask_id)  # [B,1,H,W]
-        if unmasked.any():
-            target = xt_states.squeeze(1).long()  # [B,H,W]
-
-            # шаблон: всё = -inf
-            forced = torch.full_like(log_probs, fill_value=neg_inf)  # [B,C,H,W]
-
-            forced_flat = (
-                forced.permute(0, 2, 3, 1).contiguous().view(-1, C)
-            )  # [B*H*W,C]
-            target_flat = target.view(-1)  # [B*H*W]
-            row_idx = torch.arange(forced_flat.shape[0], device=logits.device)
-            forced_flat[row_idx, target_flat] = 0.0
-
-            forced = (
-                forced_flat.view(B, H, W, C).permute(0, 3, 1, 2)
-            )  # [B,C,H,W]
-
-            unmasked_broadcast = unmasked.expand_as(log_probs)
-            log_probs[unmasked_broadcast] = forced[unmasked_broadcast]
-
-        # 4) Предсказываем класс: argmax по {0,1}, MASK игнорируем (≈ -inf)
-        probs = log_probs.exp()  # [B,C,H,W]
-        # берём только первые два класса (0 и 1)
-        x_recon = probs[:, :2, :, :].argmax(dim=1, keepdim=True)  # [B,1,H,W]
-        return x_recon.float()
-
-    def _reconstruct_from_masked(
-        self,
-        x_clean: torch.Tensor,
-        t_value: Optional[int] = None,
-    ) -> torch.Tensor:
-        """
-        Строит реконструкцию изображений из зашумлённой версии.
-
-        Алгоритм (упрощённый):
-          1) Выбираем фиксированный шаг t (по умолчанию t = T).
-          2) Генерируем xt ~ q(z_t | x0) через MaskSchedule.
-          3) Прогоняем UNet по xt.
-          4) Применяем SUBS-подобное правило для инференса.
-        """
-        self.model.eval()
-        B, C, H, W = x_clean.shape
-        if C != 1:
-            raise ValueError(
-                f"_reconstruct_from_masked: expected x_clean with C=1, got C={C}"
-            )
-
-        if t_value is None:
-            t_value = self.model.schedule.num_timesteps
-
-        t = torch.full(
-            (B,),
-            fill_value=t_value,
-            dtype=torch.long,
-            device=self.device,
-        )
-
-        # 1) Forward-процесс (маскирование)
-        xt_states, _ = self.model.schedule.forward_mask(x_clean, t)  # [B,1,H,W]
-
-        # 2) one-hot кодирование xt
-        states_flat = xt_states.view(B, H, W)  # [B,H,W]
-        one_hot = F.one_hot(
-            states_flat, num_classes=self.model.num_classes
-        ).permute(0, 3, 1, 2).float()  # [B,C,H,W]
-
-        # 3) UNet
-        logits = self.model.unet(one_hot, t)  # [B,C,H,W]
-
-        # 4) SUBS-подобное восстановление
-        x_recon = self._subs_inference_from_xt(xt_states, logits)
-        return x_recon
-
     @torch.no_grad()
     def _save_visualizations(self, epoch: int) -> None:
         """
@@ -258,7 +149,9 @@ class Trainer:
 
         # --------- 1) Unconditional сэмплы ---------
         samples = self.model.sample(
-            num_samples=num_vis, device=self.device
+            num_samples=num_vis,
+            device=self.device,
+            num_steps=self.cfg.uncond_num_steps,
         )  # [B,1,H,W]
         samples = samples.clamp(0.0, 1.0)
 
@@ -291,20 +184,30 @@ class Trainer:
         # При t=T и argmax модель (верно) предсказывает фон (наиболее вероятный класс),
         # что выглядит как черный квадрат.
         t_mid = self.model.schedule.num_timesteps // 2
-        x_recon = self._reconstruct_from_masked(x_clean, t_value=t_mid) # [B,1,H,W]
-
-        # Склеиваем: сначала все оригиналы, затем реконструкции
-        both = torch.cat([x_clean, x_recon], dim=0)  # [2B,1,H,W]
+        xt_states, xt_vis = make_xt_from_xclean(
+            model=self.model,
+            x_clean=x_clean,
+            t_value=t_mid,
+            obs_mask=None,
+        )
+        t = torch.full(
+            (x_clean.shape[0],),
+            fill_value=t_mid,
+            dtype=torch.long,
+            device=self.device,
+        )
+        x_recon = reconstruct_from_xt(self.model, xt_states, t)  # [B,1,H,W]
 
         recon_path = os.path.join(
             self.sample_dir,
             f"{self.checkpoint_prefix}_epoch{epoch:03d}_recon.png",
         )
-        vutils.save_image(
-            both,
-            recon_path,
+        save_triplet_grid(
+            x_top=x_clean,
+            x_mid=xt_vis,
+            x_bottom=x_recon,
+            path=recon_path,
             nrow=num_vis,
-            normalize=False,
         )
 
         self.logger.info(f"Saved samples to:        {samples_path}")

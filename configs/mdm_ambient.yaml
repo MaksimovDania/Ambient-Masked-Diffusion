@@ -18,6 +18,11 @@ data:
 
 model:
   image_channels: 3
+  training_mode: ambient_oracle
+  uncond_num_steps: 50
+  # Consistency loss (регуляризатор для согласованности предсказаний на соседних шагах)
+  consistency_weight: 0.0  # 0.0 = выключено, >0.0 = включено (например, 0.1, 0.5)
+  consistency_pair_offset: 1  # разница между соседними временами в паре (t_hi, t_lo)
   base_channels: 64
   channel_multipliers: [1, 2, 2]
   num_res_blocks: 2

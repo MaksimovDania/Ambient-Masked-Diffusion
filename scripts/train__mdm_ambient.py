@@ -5,7 +5,6 @@ import os
 import sys
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import torchvision.utils as vutils
@@ -22,6 +21,7 @@ from src.models.mdm_model import MaskedDiffusionModel, MaskedDiffusionConfig
 from src.utils.config import load_config
 from src.utils.logging_utils import setup_logger
 from src.utils.seed import set_seed
+from src.training.visualization import make_xt_from_xclean, reconstruct_from_xt
 
 
 # ---------------------------------------------------------------------
@@ -46,7 +46,8 @@ def build_checkpoint_prefix(cfg_dict) -> str:
     включающий некоторые важные гиперпараметры.
 
     Пример:
-      mdm_mnist_ambient_lr0p001_bs128_T100_ch64_pmiss0p5
+      mdm_mnist_ambient_lr0p001_bs128_T100_ch64_pmiss0p5_cons0p1
+      mdm_mnist_ambient_strict_lr0p001_bs128_T100_ch64_pmiss0p5_cons0p1
     """
     exp_name = cfg_dict.get("experiment_name", "mdm_ambient")
     data_cfg = cfg_dict.get("data", {})
@@ -58,90 +59,37 @@ def build_checkpoint_prefix(cfg_dict) -> str:
     T = model_cfg.get("num_timesteps", 100)
     base_ch = model_cfg.get("base_channels", 64)
     p_missing = data_cfg.get("p_missing", 0.5)
+    consistency_weight = model_cfg.get("consistency_weight", 0.0)
+    training_mode = model_cfg.get("training_mode", "ambient_oracle")
 
     lr_str = str(lr).replace(".", "p")
     pmiss_str = str(p_missing).replace(".", "p")
 
+    # Добавляем суффикс режима для ambient_strict
+    mode_suffix = ""
+    if training_mode == "ambient_strict":
+        mode_suffix = "_strict"
+
     prefix = (
-        f"{exp_name}_lr{lr_str}_bs{batch_size}_T{T}_ch{base_ch}_pmiss{pmiss_str}"
+        f"{exp_name}{mode_suffix}_lr{lr_str}_bs{batch_size}_T{T}_ch{base_ch}_pmiss{pmiss_str}"
     )
+    if consistency_weight > 0.0:
+        cons_str = str(consistency_weight).replace(".", "p")
+        prefix = f"{prefix}_cons{cons_str}"
+
     return prefix
 
 
 def move_batch_to_device(batch, device):
     """
-    Достаём из батча x_clean и obs_mask и переносим на device.
+    Достаём из батча x_clean, x_obs и obs_mask и переносим на device.
     """
-    if "x_clean" not in batch or "obs_mask" not in batch:
-        raise KeyError("Batch must contain 'x_clean' and 'obs_mask' keys.")
+    if "x_clean" not in batch or "obs_mask" not in batch or "x_obs" not in batch:
+        raise KeyError("Batch must contain 'x_clean', 'x_obs' and 'obs_mask' keys.")
     x_clean = batch["x_clean"].to(device)
+    x_obs = batch["x_obs"].to(device)
     obs_mask = batch["obs_mask"].to(device)
-    return x_clean, obs_mask
-
-
-def subs_inference_from_xt(model, xt_states, logits):
-    """
-    SUBS-подобный шаг инференса (без torch.where).
-
-    xt_states: [B,1,H,W] с {0,1,MASK}
-    logits:    [B,C,H,W] с сырыми логитами по классам {0,1,MASK}
-
-    Возвращает:
-        x_recon: [B,1,H,W] с {0,1}
-    """
-    if xt_states.dim() != 4 or logits.dim() != 4:
-        raise ValueError(
-            f"subs_inference_from_xt: expected xt_states [B,1,H,W] and logits [B,C,H,W], "
-            f"got {tuple(xt_states.shape)}, {tuple(logits.shape)}"
-        )
-
-    B, C, H, W = logits.shape
-    mask_id = model.mask_token_id
-    if C != model.num_classes:
-        raise ValueError(
-            f"subs_inference_from_xt: expected logits C={model.num_classes}, got C={C}"
-        )
-
-    neg_inf = model.cfg.neg_infinity
-
-    # 1) Запрещаем MASK-класс
-    logits = logits.clone()
-    logits[:, mask_id, :, :] += neg_inf
-
-    # 2) log-softmax
-    log_probs = logits - torch.logsumexp(logits, dim=1, keepdim=True)
-
-    # 3) Для незамаскированных позиций форсим вырожденное распределение,
-    #    копирующее xt_states.
-    unmasked = (xt_states != mask_id)  # [B,1,H,W]
-    if unmasked.any():
-        target = xt_states.squeeze(1).long()  # [B,H,W]
-
-        log_probs_unmasked = torch.full_like(
-            log_probs, fill_value=neg_inf
-        )  # [B,C,H,W]
-
-        log_probs_unmasked_flat = (
-            log_probs_unmasked.permute(0, 2, 3, 1).contiguous().view(-1, C)
-        )
-        target_flat = target.view(-1)  # [B*H*W]
-        row_idx = torch.arange(
-            log_probs_unmasked_flat.shape[0],
-            device=logits.device,
-        )
-        log_probs_unmasked_flat[row_idx, target_flat] = 0.0
-
-        log_probs_unmasked = (
-            log_probs_unmasked_flat.view(B, H, W, C).permute(0, 3, 1, 2)
-        )
-
-        unmasked_broadcast = unmasked.expand_as(log_probs)
-        log_probs[unmasked_broadcast] = log_probs_unmasked[unmasked_broadcast]
-
-    # 4) Берём argmax по классам {0,1} (MASK ≈ -inf)
-    probs = log_probs.exp()
-    x_recon = probs[:, :2, :, :].argmax(dim=1, keepdim=True).float()
-    return x_recon
+    return x_clean, x_obs, obs_mask
 
 
 def reconstruct_from_masked(model, x_clean, obs_mask, device, t_value=None):
@@ -167,32 +115,15 @@ def reconstruct_from_masked(model, x_clean, obs_mask, device, t_value=None):
     if t_value is None:
         t_value = model.schedule.num_timesteps // 2
 
-    t = torch.full(
-        (B,),
-        fill_value=t_value,
-        dtype=torch.long,
-        device=device,
+    xt_states, xt_vis = make_xt_from_xclean(
+        model=model,
+        x_clean=x_clean,
+        t_value=t_value,
+        obs_mask=obs_mask,
     )
-
-    # 1) forward-процесс
-    xt_states, _ = model.schedule.forward_mask(x_clean, t)  # [B,1,H,W]
-
-    # 2) учтём исходную маску наблюдений: obs_mask == 0 → MASK
-    missing = (obs_mask == 0)
-    if missing.any():
-        xt_states = xt_states.clone()
-        xt_states[missing] = model.mask_token_id
-
-    # 3) one-hot
-    states_flat = xt_states.view(B, H, W)
-    xt_one_hot = F.one_hot(
-        states_flat, num_classes=model.num_classes
-    ).permute(0, 3, 1, 2).float()
-
-    # 4) UNet + SUBS-инференс
-    logits = model.unet(xt_one_hot, t)
-    x_recon = subs_inference_from_xt(model, xt_states, logits)
-    return xt_states, x_recon
+    t = torch.full((B,), fill_value=t_value, dtype=torch.long, device=device)
+    x_recon = reconstruct_from_xt(model, xt_states, t)
+    return xt_vis, x_recon
 
 
 def save_visualizations(
@@ -204,6 +135,7 @@ def save_visualizations(
     checkpoint_prefix: str,
     logger,
     num_vis: int = 8,
+    uncond_num_steps: int = 50,
 ):
     """
     Сохраняет:
@@ -215,7 +147,7 @@ def save_visualizations(
 
     # ---------- 1) Unconditional сэмплы ----------
     with torch.no_grad():
-        samples = model.sample(num_samples=num_vis, device=device)
+        samples = model.sample(num_samples=num_vis, device=device, num_steps=uncond_num_steps)
     samples = samples.clamp(0.0, 1.0)
 
     samples_path = os.path.join(
@@ -240,21 +172,13 @@ def save_visualizations(
     obs_mask = batch["obs_mask"].to(device)[:num_vis]     # [B,1,H,W]
 
     # ambient-маска: xt учитывает и forward-маску, и obs_mask
-    xt_states, x_recon = reconstruct_from_masked(
+    xt_vis, x_recon = reconstruct_from_masked(
         model=model,
         x_clean=x_clean,
         obs_mask=obs_mask,
         device=device,
         t_value=model.schedule.num_timesteps // 2,
     )
-
-    # Визуализируем xt: MASK → 0.5 (серый)
-    xt_vis = xt_states.float()
-    mask_token = model.mask_token_id
-    mask_positions = (xt_states == mask_token)
-    if mask_positions.any():
-        xt_vis = xt_vis.clone()
-        xt_vis[mask_positions] = 0.5
 
     # Собираем: первая строка — x_clean, вторая — xt, третья — recon
     all_imgs = torch.cat([x_clean, xt_vis, x_recon], dim=0)
@@ -301,6 +225,16 @@ def main():
     logger.info("===== MDM ambient training started =====")
     logger.info(f"Using config: {args.config}")
     logger.info(f"Seed: {seed}")
+    
+    # Логируем training_mode и consistency_weight заранее (будут использованы при создании модели)
+    model_cfg = cfg_dict.get("model", {})
+    training_mode = model_cfg.get("training_mode", "ambient_oracle")
+    consistency_weight = model_cfg.get("consistency_weight", 0.0)
+    logger.info(f"Training mode: {training_mode}")
+    if consistency_weight > 0.0:
+        logger.info(f"Consistency loss enabled: weight={consistency_weight}, pair_offset={model_cfg.get('consistency_pair_offset', 1)}")
+    else:
+        logger.info("Consistency loss disabled (consistency_weight=0.0)")
 
     # --------- Устройство ---------
     device_str = cfg_dict.get("device", "mps")
@@ -344,8 +278,19 @@ def main():
     )
     schedule = MaskSchedule(schedule_config)
 
+    consistency_weight = model_cfg.get("consistency_weight", 0.0)
+    consistency_pair_offset = model_cfg.get("consistency_pair_offset", 1)
+    training_mode = model_cfg.get("training_mode", "ambient_oracle")
+    if training_mode not in {"ambient_oracle", "ambient_strict"}:
+        raise ValueError(
+            f"train__mdm_ambient.py: training_mode must be 'ambient_oracle' or 'ambient_strict', "
+            f"got '{training_mode}'"
+        )
     mdm_cfg = MaskedDiffusionConfig(
-        neg_infinity=cfg_dict.get("model", {}).get("neg_infinity", -1e9)
+        neg_infinity=model_cfg.get("neg_infinity", -1e9),
+        training_mode=training_mode,  # ambient_oracle or ambient_strict
+        consistency_weight=consistency_weight,
+        consistency_pair_offset=consistency_pair_offset,
     )
     model = MaskedDiffusionModel(
         unet=unet,
@@ -391,9 +336,13 @@ def main():
         )
 
         for step, batch in enumerate(train_iter, start=1):
-            x_clean, obs_mask = move_batch_to_device(batch, device)
+            x_clean, x_obs, obs_mask = move_batch_to_device(batch, device)
 
-            loss = model.compute_loss(x_clean, obs_mask=obs_mask)
+            # Для ambient_strict используем x_obs, для ambient_oracle - x_clean
+            if training_mode == "ambient_strict":
+                loss = model.compute_loss(x_obs, obs_mask=obs_mask)
+            else:  # ambient_oracle
+                loss = model.compute_loss(x_clean, obs_mask=obs_mask)
 
             optimizer.zero_grad()
             loss.backward()
@@ -430,8 +379,12 @@ def main():
                 leave=False,
             )
             for batch in val_iter:
-                x_clean, obs_mask = move_batch_to_device(batch, device)
-                loss = model.compute_loss(x_clean, obs_mask=obs_mask)
+                x_clean, x_obs, obs_mask = move_batch_to_device(batch, device)
+                # Для ambient_strict используем x_obs, для ambient_oracle - x_clean
+                if training_mode == "ambient_strict":
+                    loss = model.compute_loss(x_obs, obs_mask=obs_mask)
+                else:  # ambient_oracle
+                    loss = model.compute_loss(x_clean, obs_mask=obs_mask)
                 val_running_loss += loss.item()
                 val_num_batches += 1
 
@@ -459,6 +412,7 @@ def main():
         logger.info(f"Saved checkpoint: {ckpt_path}")
 
         # ----- Визуализации -----
+        uncond_num_steps = model_cfg.get("uncond_num_steps", 50)
         save_visualizations(
             model=model,
             val_loader=val_loader,
@@ -468,6 +422,7 @@ def main():
             checkpoint_prefix=checkpoint_prefix,
             logger=logger,
             num_vis=8,
+            uncond_num_steps=uncond_num_steps,
         )
 
     logger.info("===== MDM ambient training finished =====")
